@@ -8,6 +8,7 @@ import argparse
 from tqdm import tqdm
 from pathlib import Path
 from sklearn.cluster import KMeans
+from skimage.morphology import remove_small_holes, remove_small_objects
 
 def options():
     parser = argparse.ArgumentParser(description='Cranberry external image processing V1.')
@@ -177,8 +178,10 @@ def validate_output_df(output_df):
 
 class SingleCranImage():
     def __init__(self, Path):
-        self.img, self.path, self.filename = pcv.readimage(str(Path))
-        self.gray = pcv.rgb2gray(self.img)
+        self.img = cv2.imread(str(Path))
+        self.dir = str(Path.parent)
+        self.filename = Path.name
+        self.gray = cv2.cvtColor(self.img, cv2.COLOR_BGR2GRAY)
         self.lab = cv2.cvtColor(self.img, cv2.COLOR_BGR2LAB)
         self.hsv = cv2.cvtColor(self.img, cv2.COLOR_BGR2HSV)
     
@@ -193,30 +196,12 @@ class SingleCranImage():
                                                     spacing=spacing,
                                                     ncols=4, nrows=6)
 
-    def find_white_cards(self, min_area_px = 200000):
-        # for both text and size markers, we are looking for a large white card
-        # static threshold values on low saturation and high brightness should work consistently
-        thr_lowsat = pcv.threshold.binary(self.hsv[:,:,1], 100, object_type='dark')
-        thr_highval = pcv.threshold.binary(self.hsv[:,:,2], 100, object_type='light')
-        thr_white = pcv.logical_and(thr_lowsat, thr_highval)
-        thr_white = pcv.fill_holes(thr_white)
-        thr_white = pcv.fill(thr_white, min_area_px)
-
-        card_contours, hierarchy = cv2.findContours(thr_white, 0, 2)
-        # formerly had the script check that there were two cards, unnecessary
-        # if len(card_contours) != 2:
-        #     print('Issue in image %s' % self.filename)
-        #     print('Should be two white cards, but more found: %s' % len(card_contours))          
-
-        card_moments = [cv2.moments(cnt) for cnt in card_contours]
-        card_centers = [(int(M['m10']/M['m00']), int(M['m01']/M['m00'])) for M in card_moments]
-        text_card_i = [i for (i,c) in enumerate(card_centers) if 1000 < c[0] < 4000 and c[1] > 2500]
-
     def find_size_markers(self, min_area_px = 10000):
         # PlantCV's off-the-shelf function is very very rigid, only works with single marker
         # manually analyze the markers instead, faster this way any way
         # markers are around 70k pixels in all images so far, 10k cutoff is very forgiving
-        thr_black = pcv.threshold.binary(self.hsv[:,:,2], 70, object_type='dark')
+        _,thr_black = cv2.threshold(self.hsv[:,:,2], 70, 255, cv2.THRESH_BINARY_INV)
+        #thr_black = pcv.fill(thr_black, min_area_px)
         thr_black = pcv.fill(thr_black, min_area_px)
         marker_contours, hierarchy = cv2.findContours(thr_black, 0, 2)
         marker_contours = [x for x in marker_contours if roundnessContour(x) > 0.95]
@@ -228,46 +213,24 @@ class SingleCranImage():
             print('Issue in image %s' % self.filename)
             print('Size markers with >5 percent deviation from mean marker size. Check size markers on this image')
         
-    def scrape_card_text(self):
-        # text card should be located near center bottom of image
-        # check centroids of big white objects
-        card_keys = [x for x in pcv.outputs.observations.keys() if x.startswith('card_')]
-        card_centers = [pcv.outputs.observations[k]['center_of_mass']['value'] for k in card_keys]
-        text_card_i = [k for (k,c) in zip(card_keys, card_centers) if 1000 < c[0] < 4000 and c[1] > 2500]
-        
-        # ensure that we have exactly 1 text card
-        if len(text_card_i) != 1:
-            print('Issue in image %s' % self.filename)
-            print('Incorrect number of text cards found: %s' % str(len(text_card_i)))
-        
-        # find the bounding rectangle, crop off 15% on all sides to improve text parsing
-        x,y,w,h = cv2.boundingRect(card_contours[text_card_i[0]])
-        text_crop = self.gray[(y + int(0.15*h)):(y + int(0.85*h)),(x + int(0.15*w)):(x + int(0.85*w))]
-        card_text = pytesseract.image_to_string(self.card_crop)
-        self.card_text = card_text.strip().replace(' ', '')
-        if self.card_text == self.filename.replace('.jpg', ''):
-            print('Name scraped matches filename')
-        else:
-            print('Filename: %s\tScrapedName: %s' % (self.filename.replace('.jpg', ''), card_text))
-
     def find_berries(self, whitebg = False):
         if not whitebg:
             # with blue background, easier to read if we select the background, then invert
             # hue should be very close to 103. In practice, almost always within 2 of 103. Allowing within 15 is a bit more lenient
             nonblue = np.abs(self.hsv[:,:,0].astype(np.int32) - 103)
             nonblue = nonblue.astype(np.uint8)
-            thr_highblue = pcv.threshold.binary(nonblue, 15, object_type='dark')
+            _,thr_highblue = cv2.threshold(nonblue, 15, 255, cv2.THRESH_BINARY_INV)
             # white objects can take on blueish tint, so select on moderately high saturation (paper ~ 40, background ~200)
-            thr_sat = pcv.threshold.binary(self.hsv[:,:,1], 100, object_type='light')
+            _,thr_sat = cv2.threshold(self.hsv[:,:,1], 100, 255, cv2.THRESH_BINARY)
             # black berries reflect blueish bg on edges, so select moderately bright objects
-            thr_val = pcv.threshold.binary(self.hsv[:,:,2], 100, object_type='light')
+            _,thr_val = cv2.threshold(self.hsv[:,:,2], 100, 255, cv2.THRESH_BINARY)
             thr_bg = cv2.bitwise_and(thr_highblue, cv2.bitwise_and(thr_sat, thr_val))
-            thr_fg = pcv.invert(thr_bg)
+            thr_fg = 255 - thr_bg
         else:
             # high-ish saturation grabs unripe/ripe berries
-            thr_sat = pcv.threshold.binary(self.hsv[:,:,1], 40, object_type='light')
+            _,thr_sat = cv2.threshold(self.hsv[:,:,1], 40, 255, cv2.THRESH_BINARY)
             # low value grabs dark berries and size markers
-            thr_val = pcv.threshold.binary(self.hsv[:,:,2], 120, object_type='dark')
+            _,thr_val = cv2.threshold(self.hsv[:,:,2], 120, 255, cv2.THRESH_BINARY_INV)
             thr_fg = cv2.bitwise_or(thr_sat, thr_val)
         # fill holes, smooth to remove hairs, remove small objects, then remove very large objects (color card, label, etc)
         thr_fg = pcv.fill_holes(thr_fg)
@@ -305,7 +268,7 @@ class SingleCranImage():
         berry_df['center_px_y'] = [int(obb[0][1]) for obb in self.obb_list]
         # insert file/path last so single value nicely scales up to n rows
         berry_df.insert(0, 'filename', self.filename)
-        berry_df.insert(0, 'path', self.path)
+        berry_df.insert(0, 'dir', self.dir)
         self.berry_df = berry_df
 
     def sort_berries(self):
@@ -388,7 +351,6 @@ def analyze_single_path(path, arg_ns):
     # separate out directory analysis into a function for easier passing to tqdm/multiprocessing
     cran = SingleCranImage(path)
     cran.find_size_markers()
-    #cran.scrape_card_text()
     cran.find_berries(whitebg=arg_ns.whitebg)
     cran.measure_berries()
     cran.measure_color()
